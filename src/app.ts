@@ -1,6 +1,7 @@
-import { makeWASocket, initAuthCreds, BufferJSON, makeCacheableSignalKeyStore, SignalDataSet } from "@whiskeysockets/baileys";
+import { makeWASocket, initAuthCreds, BufferJSON, makeCacheableSignalKeyStore, SignalDataSet, SignalDataTypeMap } from "@whiskeysockets/baileys";
 import mysql from "mysql2/promise";
 import pino from "pino";
+import { IAppStateSyncKeyData } from "./types/baileys";
 
 const logger = pino({ level: "trace" });
 
@@ -26,14 +27,10 @@ const connectDB = async (): Promise<DatabaseConnection> => {
 async function setupDatabase(db: DatabaseConnection) {
     try {
         await db.execute(`
-            CREATE TABLE IF NOT EXISTS wa_sessions (
+             CREATE TABLE IF NOT EXISTS wa_sessions (
                 id VARCHAR(100) PRIMARY KEY,
-                noise_key LONGTEXT NOT NULL,
-                signed_identity_key LONGTEXT NOT NULL,
-                signed_pre_key LONGTEXT NOT NULL,
-                adv_secret_key VARCHAR(255) NOT NULL,
+                creds LONGTEXT NULL,
                 keys_ LONGTEXT NULL,
-                appStateSyncKeys_ LONGTEXT NULL,
                 is_active BOOLEAN DEFAULT TRUE
             )
         `);
@@ -43,31 +40,23 @@ async function setupDatabase(db: DatabaseConnection) {
     }
 }
 
-async function saveCreds(db: DatabaseConnection, sessionId: string, creds: any, keyStore: any, appStateSyncKeys: any) {
+async function saveCreds(db: DatabaseConnection, sessionId: string, creds: any, keyStore: any) {
     try {
         const keys = await keyStore.storage; // Obtener las claves del KeyStore
 
         const query = `
-            INSERT INTO wa_sessions (id, noise_key, signed_identity_key, signed_pre_key, adv_secret_key, keys_, appStateSyncKeys_, is_active) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, TRUE) 
+            INSERT INTO wa_sessions (id, creds, keys_, is_active) 
+            VALUES (?, ?, ?, TRUE) 
             ON DUPLICATE KEY UPDATE 
-                noise_key = VALUES(noise_key),
-                signed_identity_key = VALUES(signed_identity_key),
-                signed_pre_key = VALUES(signed_pre_key),
-                adv_secret_key = VALUES(adv_secret_key),
-                keys_ = VALUES(keys_),
-                appStateSyncKeys_ = VALUES(appStateSyncKeys_),
-                is_active = TRUE;
+            creds = VALUES(creds),
+            keys_ = VALUES(keys_),
+            is_active = TRUE;
         `;
 
         await db.execute(query, [
             sessionId,
-            JSON.stringify(creds.noiseKey, BufferJSON.replacer),
-            JSON.stringify(creds.signedIdentityKey, BufferJSON.replacer),
-            JSON.stringify(creds.signedPreKey, BufferJSON.replacer),
-            creds.advSecretKey,
+            creds,
             keys ? JSON.stringify(keys, BufferJSON.replacer) : {},
-            appStateSyncKeys ? JSON.stringify(appStateSyncKeys, BufferJSON.replacer) : "{}",
         ]);
 
         console.log(`✅ Claves guardadas correctamente para la sesión: ${sessionId}`);
@@ -79,7 +68,7 @@ async function saveCreds(db: DatabaseConnection, sessionId: string, creds: any, 
 async function getCreds(db: DatabaseConnection, sessionId: string) {
     try {
         const [rows] = await db.execute(
-            `SELECT noise_key, signed_identity_key, signed_pre_key, adv_secret_key, keys_, appStateSyncKeys_ FROM wa_sessions WHERE id = ? AND is_active = TRUE`,
+            `SELECT creds, keys_ FROM wa_sessions WHERE id = ? AND is_active = TRUE`,
             [sessionId]
         );
 
@@ -87,14 +76,8 @@ async function getCreds(db: DatabaseConnection, sessionId: string) {
 
         const row = (rows as any[])[0];
         return {
-            creds: {
-                noiseKey: JSON.parse(row.noise_key, BufferJSON.reviver),
-                signedIdentityKey: JSON.parse(row.signed_identity_key, BufferJSON.reviver),
-                signedPreKey: JSON.parse(row.signed_pre_key, BufferJSON.reviver),
-                advSecretKey: row.adv_secret_key,
-            },
+            creds: JSON.parse(row.creds, BufferJSON.reviver),
             keys: JSON.parse(row.keys_ || "{}", BufferJSON.reviver),
-            appStateSyncKeys: JSON.parse(row.appStateSyncKeys_ || "{}", BufferJSON.reviver),
         };
     } catch (error) {
         console.error("❌ Error obteniendo credenciales:", error);
@@ -114,80 +97,32 @@ async function connectToWhatsApp(sessionId: string = "default") {
             printQRInTerminal: true,
         });
 
-        // const keyStore = makeCacheableSignalKeyStore(sock.authState.keys, logger);
-
-        const keyStore = makeCacheableSignalKeyStore(
-            {
-                get: async (key) => {
-                    console.log("🔍 Buscando clave:", key);
-                    const [rows] = await db.execute(
-                        `SELECT keys_ FROM wa_sessions WHERE id = ? AND is_active = TRUE`,
-                        [sessionId]
-                    );
-
-                    if ((rows as any[]).length === 0) {
-                        console.log("⚠️ No se encontró la clave en la base de datos.");
-                        return undefined;
-                    }
-
-                    const row = (rows as any[])[0];
-                    const keys = row.keys_ ? JSON.parse(row.keys_, BufferJSON.reviver) : {};
-                    return keys[key] || undefined;
-                },
-
-                set: async (data) => {
-                    console.log("💾 Guardando claves:", data);
-                    const [rows] = await db.execute(
-                        `SELECT keys_ FROM wa_sessions WHERE id = ? AND is_active = TRUE`,
-                        [sessionId]
-                    );
-
-                    let existingKeys = {};
-                    if ((rows as any[]).length > 0) {
-                        const row = (rows as any[])[0];
-                        existingKeys = row.keys_ ? JSON.parse(row.keys_, BufferJSON.reviver) : {};
-                    }
-
-                    // Combinar claves existentes con las nuevas
-                    Object.assign(existingKeys, data);
-
-                    await db.execute(
-                        `UPDATE wa_sessions SET keys_ = ? WHERE id = ? AND is_active = TRUE`,
-                        [JSON.stringify(existingKeys, BufferJSON.replacer), sessionId]
-                    );
-                },
-            },
-            logger
-        );
-
-
-
-        (async () => {
-            const [rows] = await db.execute(
-                `SELECT keys_ FROM wa_sessions WHERE id = ? AND is_active = TRUE`,
-                [sessionId]
-            );
-
-            if ((rows as any[]).length > 0) {
-                const row = (rows as any[])[0];
-                const allKeys = row.keys_ ? JSON.parse(row.keys_, BufferJSON.reviver) : {};
-
-                // Obtener solo los Pre-Keys y sus IDs
-                const preKeysWithIds = Object.entries(allKeys)
-                    .filter(([key, _]) => key.includes("pre-key"))
-                    .map(([key, value]) => ({ id: key, value }));
-
-                console.log("🔑 Pre-Keys con IDs:", preKeysWithIds);
-            } else {
-                console.log("⚠️ No se encontraron pre-keys en la base de datos.");
-            }
-        })();
-
-
-        // console.log("keyStore:", keyStore.get("app-state-sync-key"))
-
         sock.ev.on("creds.update", async () => {
-            await saveCreds(db, sessionId, sock.authState.creds, keyStore, sock.authState.keys);
+
+            const _keys_ = {
+                keys: {
+                    async get<T extends keyof SignalDataTypeMap>(
+                        type: T,
+                        ids
+                    ): Promise<{ [id: string]: SignalDataTypeMap[T] }> {
+
+                        let appStateSyncKeyData: IAppStateSyncKeyData = {};
+
+                        let data: { [id: string]: SignalDataTypeMap[T] } = {};
+
+                        if (type === "app-state-sync-key" && appStateSyncKeyData.keyData) {
+                        }
+
+                        return data;
+                    }
+
+                }
+            }
+
+            console.log("KEYS:", _keys_)
+
+            const keysSession = await sock.authState.keys
+            await saveCreds(db, sessionId, sock.authState.creds, keysSession);
         });
 
         sock.ev.on("connection.update", async (update) => {
